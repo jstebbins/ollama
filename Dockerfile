@@ -1,5 +1,6 @@
 # vim: filetype=dockerfile
 
+ARG TARGETARCH
 ARG FLAVOR=${TARGETARCH}
 ARG PARALLEL=8
 
