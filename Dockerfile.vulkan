@@ -1,0 +1,197 @@
+# vim: filetype=dockerfile
+
+ARG TARGETARCH
+ARG FLAVOR=${TARGETARCH}
+ARG PARALLEL=8
+
+# Image: base-mesa-new
+FROM registry.fedoraproject.org/fedora:43 AS base-mesa-new
+
+ARG MESA_VERSION=25.3.0_rc2
+ARG MESA_VERSION_UNDERSCORE=25.3.0_rc2
+ARG MESA_SHA256=6e5f398a63912676aad9b8b71f8afa08f0855cf17e4130e9d632574d76fd9aa4
+
+RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
+      make gcc ccache cmake ninja-build lld \
+      git vim wget g++ glibc-devel rust clang meson \
+      glslang cbindgen bindgen-cli libclc-devel llvm-config \
+      spirv-llvm-translator-devel spirv-tools-devel clang-devel \
+      python3-mako python3-pyyaml libdrm-devel \
+      systemd-libs systemd-devel llvm-libs llvm-devel \
+      elfutils-devel bison flex libXext-devel \
+      expat-devel libxshmfence-devel libXxf86vm-devel libXrandr-devel \
+      libpng-devel libxml2-devel wayland-devel \
+      compiler-rt \
+      vulkan-loader-devel vulkaninfo \
+      radeontop glslc \
+    && dnf clean all && rm -rf /var/cache/dnf/*
+
+WORKDIR /opt/mesa
+RUN wget "https://archive.mesa3d.org/mesa-${MESA_VERSION_UNDERSCORE/_/-}.tar.xz" -O "mesa-${MESA_VERSION}.tar.xz" \
+    && echo "${MESA_SHA256}  mesa-${MESA_VERSION}.tar.xz" | sha256sum -c - \
+    && tar -xf "mesa-${MESA_VERSION}.tar.xz" \
+    && rm "mesa-${MESA_VERSION}.tar.xz" \
+    && cd "mesa-${MESA_VERSION_UNDERSCORE/_/-}" \
+    && CFLAGS+=" -g1" CXXFLAGS+=" -g1" meson setup build \
+       --prefix=/usr/local \
+       --buildtype=release \
+       -D b_ndebug=true \
+       -D android-libbacktrace=disabled \
+       -D gallium-drivers=r300,r600,radeonsi,nouveau,virgl,svga,llvmpipe,softpipe,iris,crocus,i915,zink,d3d12,asahi,freedreno \
+       -D gallium-extra-hud=true \
+       -D gallium-mediafoundation=disabled \
+       -D gallium-rusticl=true \
+       -D gles1=disabled \
+       -D html-docs=disabled \
+       -D intel-rt=enabled \
+       -D libunwind=disabled \
+       -D microsoft-clc=disabled \
+       -D sysprof=false \
+       -D valgrind=disabled \
+       -D video-codecs=all \
+       -D vulkan-drivers=amd,gfxstream,intel,intel_hasvk,nouveau,swrast,virtio,microsoft-experimental,asahi,freedreno \
+       -D vulkan-layers=device-select,intel-nullhw,overlay,screenshot,vram-report-limit,anti-lag \
+    && meson compile -C build \
+    && meson install -C build \
+    && cd /opt/mesa && rm -rf "mesa-${MESA_VERSION_UNDERSCORE/_/-}"
+
+# Image: base-vulkan
+FROM registry.fedoraproject.org/fedora:43 AS base-vulkan
+
+RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
+      gcc ccache ninja-build wget \
+    && dnf clean all && rm -rf /var/cache/dnf/*
+
+WORKDIR /opt/vulkansdk
+ARG VULKANVERSION=1.4.328.1
+RUN wget https://sdk.lunarg.com/sdk/download/${VULKANVERSION}/linux/vulkansdk-linux-x86_64-${VULKANVERSION}.tar.xz -O ./vulkansdk-linux-x86_64-${VULKANVERSION}.tar.xz \
+    && tar xvf ./vulkansdk-linux-x86_64-${VULKANVERSION}.tar.xz \
+    && sed -i 's/sudo dnf/sudo dnf -y/' ./${VULKANVERSION}/vulkansdk \
+    && ./${VULKANVERSION}/vulkansdk -j 8 vulkan-headers \
+    && ./${VULKANVERSION}/vulkansdk -j 8 shaderc
+RUN cp -r ./${VULKANVERSION}/x86_64/include/* /usr/local/include/ \
+    && cp -r ./${VULKANVERSION}/x86_64/lib/* /usr/local/lib
+ENV PATH=/opt/vulkansdk/${VULKANVERSION}/x86_64/bin:$PATH
+
+# Image: base
+FROM base-vulkan AS base-ollama
+WORKDIR /opt/ollama
+COPY CMakeLists.txt CMakePresets.json .
+COPY ml/backend/ggml/ggml ml/backend/ggml/ggml
+ENV LDFLAGS=-s
+
+# Image: ollama-cpu
+FROM base-ollama AS ollama-cpu
+ARG PARALLEL
+RUN --mount=type=cache,target=/root/.ccache \
+    cmake --preset 'CPU' \
+        && cmake --build --parallel ${PARALLEL} --preset 'CPU' \
+        && cmake --install build --component CPU --strip --parallel ${PARALLEL}
+
+# Image: ollama-vulkan
+FROM base-ollama AS ollama-vulkan
+RUN --mount=type=cache,target=/root/.ccache \
+    cmake --preset 'Vulkan' -DOLLAMA_RUNNER_DIR="vulkan" \
+        && cmake --build --parallel --preset 'Vulkan' \
+        && cmake --install build --component Vulkan --strip --parallel 8 
+
+# Image: ollama-build
+FROM base-ollama AS ollama-build
+WORKDIR /go/src/github.com/ollama/ollama
+COPY go.mod go.sum .
+RUN curl -fsSL https://golang.org/dl/go$(awk '/^go/ { print $2 }' go.mod).linux-amd64.tar.gz | tar xz -C /usr/local
+ENV PATH=/usr/local/go/bin:$PATH
+RUN go mod download
+COPY . .
+ARG GOFLAGS="'-ldflags=-w -s'"
+ENV CGO_ENABLED=1
+ARG CGO_CFLAGS
+ARG CGO_CXXFLAGS
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    go build -trimpath -buildmode=pie -o /bin/ollama .
+
+# Image: archive
+FROM scratch AS archive
+COPY --from=ollama-vulkan  /opt/ollama/dist/lib/ollama  /lib/ollama/
+COPY --from=ollama-cpu /opt/ollama/dist/lib/ollama /lib/ollama
+COPY --from=ollama-build /bin/ollama /bin/ollama
+
+# Image: toolbox
+FROM registry.fedoraproject.org/fedora-minimal:43 AS toolbox
+RUN microdnf -y --nodocs --setopt=install_weak_deps=0 install \
+      bash ncurses ca-certificates mesa-vulkan-drivers \
+      vulkan-loader vulkan-loader-devel vulkaninfo radeontop \
+  && microdnf clean all && rm -rf /var/cache/dnf/*
+
+COPY --from=archive /bin /usr/bin
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+COPY --from=archive /lib/ollama /usr/lib/ollama
+ENV OLLAMA_HOST=0.0.0.0:11434
+EXPOSE 11434
+CMD ["/bin/bash"]
+
+# Image: toolbox-mesa-new
+FROM registry.fedoraproject.org/fedora-minimal:43 AS toolbox-mesa-new
+RUN microdnf -y --nodocs --setopt=install_weak_deps=0 install \
+      bash ncurses ca-certificates \
+      vulkan-loader vulkan-loader-devel vulkaninfo radeontop \
+      llvm-libs libX11-xcb libxshmfence spirv-tools-libs elfutils-libs libdrm \
+      libwayland-client libXext libXxf86vm clang-libs spirv-llvm-translator libpng \
+  && microdnf clean all && rm -rf /var/cache/dnf/*
+
+# copy our custom Mesa 25.3 build
+COPY --from=base-mesa-new /usr/local/ /usr/local/
+
+# ld
+RUN echo "/usr/local/lib"   > /etc/ld.so.conf.d/local.conf \
+ && echo "/usr/local/lib64" >> /etc/ld.so.conf.d/local.conf \
+ && ldconfig
+
+COPY --from=archive /bin /usr/bin
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+COPY --from=archive /lib/ollama /usr/lib/ollama
+ENV OLLAMA_HOST=0.0.0.0:11434
+EXPOSE 11434
+CMD ["/bin/bash"]
+
+# Image: default-mesa-new
+FROM registry.fedoraproject.org/fedora-minimal:43 AS default-mesa-new
+RUN microdnf -y --nodocs --setopt=install_weak_deps=0 install \
+      ca-certificates \
+      vulkan-loader vulkan-loader-devel \
+      llvm-libs libX11-xcb libxshmfence spirv-tools-libs elfutils-libs libdrm \
+      libwayland-client libXext libXxf86vm clang-libs spirv-llvm-translator libpng \
+  && microdnf clean all && rm -rf /var/cache/dnf/*
+
+# copy our custom Mesa 25.3 build
+COPY --from=base-mesa-new /usr/local/ /usr/local/
+
+# ld
+RUN echo "/usr/local/lib"   > /etc/ld.so.conf.d/local.conf \
+ && echo "/usr/local/lib64" >> /etc/ld.so.conf.d/local.conf \
+ && ldconfig
+
+COPY --from=archive /bin /usr/bin
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+COPY --from=archive /lib/ollama /usr/lib/ollama
+ENV OLLAMA_FLASH_ATTENTION=1
+ENV OLLAMA_HOST=0.0.0.0:11434
+EXPOSE 11434
+ENTRYPOINT ["/bin/ollama"]
+CMD ["serve"]
+
+# Image: default
+FROM registry.fedoraproject.org/fedora-minimal:43 AS default
+RUN microdnf -y --nodocs --setopt=install_weak_deps=0 install \
+      ca-certificates mesa-vulkan-drivers \
+      vulkan-loader vulkan-loader-devel \
+  && microdnf clean all && rm -rf /var/cache/dnf/*
+
+COPY --from=archive /bin /usr/bin
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+COPY --from=archive /lib/ollama /usr/lib/ollama
+ENV OLLAMA_FLASH_ATTENTION=1
+ENV OLLAMA_HOST=0.0.0.0:11434
+EXPOSE 11434
+ENTRYPOINT ["/bin/ollama"]
+CMD ["serve"]
