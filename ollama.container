@@ -1,0 +1,17 @@
+[Unit]
+Description=Ollama Service
+
+[Container]
+Image=localhost/ollama-mesa-new
+ContainerName=ollama-mesa-new
+PublishPort=11434:11434/tcp
+AddDevice=/dev/dri
+GroupAdd=video
+SeccompProfile=unconfined
+Volume=%h/.ollama:/root/.ollama:z
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target
