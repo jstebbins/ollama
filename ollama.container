@@ -4,6 +4,7 @@ Description=Ollama Service
 [Container]
 Image=localhost/ollama-mesa-new
 ContainerName=ollama-mesa-new
+Environment="OLLAMA_NUM_PARALLEL=4"
 PublishPort=11434:11434/tcp
 AddDevice=/dev/dri
 GroupAdd=video
