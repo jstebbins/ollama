@@ -7,9 +7,9 @@ ARG PARALLEL=8
 # Image: base-mesa-new
 FROM registry.fedoraproject.org/fedora:43 AS base-mesa-new
 
-ARG MESA_VERSION=25.3.0_rc4
-ARG MESA_VERSION_UNDERSCORE=25.3.0_rc4
-ARG MESA_SHA256=e377f77449e892f237dfd9de7e6508dd743ffb8de89a43938a4e357fb28a3b68
+ARG MESA_VERSION=25.3.0
+ARG MESA_VERSION_UNDERSCORE=25.3.0
+ARG MESA_SHA256=0fd54fea7dbbddb154df05ac752b18621f26d97e27863db3be951417c6abe8ae
 
 RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
       make gcc ccache cmake ninja-build lld \
